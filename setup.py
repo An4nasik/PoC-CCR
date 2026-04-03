@@ -53,9 +53,7 @@ def get_leader_ip() -> str:
 
 
 def replication_status() -> str | None:
-    response = requests.get(
-        f"{FOLLOWER}/_plugins/_replication/{INDEX}/_status", timeout=10
-    )
+    response = requests.get(f"{FOLLOWER}/_plugins/_replication/{INDEX}/_status", timeout=10)
     if response.ok:
         return response.json().get("status", "unknown")
     return None
@@ -117,9 +115,7 @@ def main() -> None:
         f"{FOLLOWER}/_cluster/settings",
         json={
             "persistent": {
-                "cluster": {
-                    "remote": {CONNECTION_ALIAS: {"seeds": [f"{leader_ip}:9300"]}}
-                }
+                "cluster": {"remote": {CONNECTION_ALIAS: {"seeds": [f"{leader_ip}:9300"]}}}
             }
         },
         timeout=10,

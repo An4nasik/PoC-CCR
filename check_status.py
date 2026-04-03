@@ -39,9 +39,7 @@ def check_cluster(url: str, name: str) -> None:
         log.error("count request failed error=%s", err)
 
     try:
-        status_response = requests.get(
-            f"{url}/_plugins/_replication/{INDEX}/_status", timeout=3
-        )
+        status_response = requests.get(f"{url}/_plugins/_replication/{INDEX}/_status", timeout=3)
         if status_response.ok:
             data = status_response.json()
             status = data.get("status", "unknown")

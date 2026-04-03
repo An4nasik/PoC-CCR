@@ -97,7 +97,13 @@ def main() -> None:
                 ts = source.get("timestamp", "")
                 counter = source.get("counter", "n/a")
                 data = source.get("data", "")
-                log.info("read endpoint=%s counter=%s ts=%s data=%s", endpoint, counter, ts, data)
+                log.info(
+                    "read endpoint=%s counter=%s ts=%s data=%s",
+                    endpoint,
+                    counter,
+                    ts,
+                    data,
+                )
                 if ts:
                     LAST_TIMESTAMP = ts
         else:

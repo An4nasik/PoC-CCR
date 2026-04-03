@@ -76,11 +76,7 @@ def main() -> None:
         f"{FOLLOWER}/_plugins/_replication/{INDEX}/_status",
         timeout=10,
     )
-    status = (
-        status_response.json().get("status", "unknown")
-        if status_response.ok
-        else "unknown"
-    )
+    status = status_response.json().get("status", "unknown") if status_response.ok else "unknown"
     log.info("status after stop=%s", status)
 
     log.info("verifying writes")
