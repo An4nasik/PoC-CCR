@@ -1,87 +1,86 @@
 # PoC OpenSearch Cross-Cluster Replication
 
-## Быстрый старт
+## Конфигурация
 
-### 1. Запуск кластеров
-```bash
+Все скрипты читают параметры из `.env`.
+
+Файл уже есть в проекте. При необходимости можешь обновить его по шаблону `.env.example`.
+
+Основные параметры:
+- `LEADER_URL`
+- `FOLLOWER_URL`
+- `CCR_INDEX`
+- `CCR_ALIAS`
+- `OPENSEARCH_URLS`
+- `PRODUCER_STRATEGY`
+- `FAILOVER_ERRORS_THRESHOLD`
+
+`PRODUCER_STRATEGY=auto` работает так:
+- старт в `round_robin`;
+- после серии ошибок автоматическое переключение в `failover`;
+- в `failover` продюсер закрепляется на writable endpoint.
+
+## Быстрый запуск (Windows)
+
+### 1) Поднять кластеры
+```powershell
 docker compose up -d
 ```
 
-### 2. Инициализация CCR
-```bash
-pip install requests
+### 2) Настроить CCR
+```powershell
 python setup.py
 ```
 
-По умолчанию используется индекс `rag_data`.
-Если нужен новый индекс, перед запуском задайте:
-```bash
-set CCR_INDEX=rag_data_2
-```
-
-### 3. Запуск producer (пишет в Leader)
-```bash
-set OPENSEARCH_URL=http://localhost:9200
+### 3) Запустить продюсер
+```powershell
 python producer.py
 ```
 
-Round robin между кластерами:
-```bash
-set OPENSEARCH_URLS=http://localhost:9200,http://localhost:9201
-set PRODUCER_STRATEGY=round_robin
-python producer.py
-```
-
-### 4. Проверка репликации (в другом терминале)
-```bash
+### 4) Проверить статус
+```powershell
 python check_status.py
 ```
 
-`check_status.py` использует переменную `CCR_INDEX`, поэтому индекс можно менять без правки кода:
-```bash
-set CCR_INDEX=rag_data_2
-python check_status.py
-```
-
-### 5. Эмуляция аварии Leader
-```bash
+### 5) Эмулировать падение лидера
+```powershell
 docker stop os-cluster-1
-# Producer начнёт сыпать ошибками
 ```
 
-### 6. Failover на Follower
-```bash
+### 6) Выполнить failover
+```powershell
 python failover.py
 ```
 
-### 7. Перезапуск producer на новый Leader
-```bash
-set OPENSEARCH_URL=http://localhost:9201
+### 7) Проверить, что запись продолжается
+```powershell
 python producer.py
 ```
 
-## Скрипт "Сделать все" (Windows)
-
-Один скрипт прогоняет весь Stage-1 сценарий: поднимает стек, настраивает CCR, запускает producer, эмулирует падение лидера, делает failover и проверяет итог.
+## Полный сценарий одной командой
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_all.ps1
 ```
 
-Для запуска с новым индексом:
+## Смена индекса
+
+Меняешь `CCR_INDEX` в `.env` и повторно запускаешь:
+
 ```powershell
-$env:CCR_INDEX="rag_data_2"
-powershell -ExecutionPolicy Bypass -File .\run_all.ps1
+python setup.py
+python check_status.py
 ```
 
 ## Структура файлов
 - `docker-compose.yml` — два OpenSearch кластера
-- `setup.py` — инициализация индекса и CCR
+- `config.py` — загрузка `.env`
+- `setup.py` — создание индекса и настройка CCR
 - `producer.py` — запись документов
-- `failover.py` — повышение Follower до Leader
-- `check_status.py` — проверка статуса
-- `run_all.ps1` — полный автоматический Stage-1 прогон для Windows
+- `failover.py` — перевод follower в writable режим
+- `check_status.py` — проверка состояния кластеров и репликации
+- `run_all.ps1` — автоматический Stage-1 прогон
 
 ## Порты
-- Leader (cluster-1): `http://localhost:9200`
-- Follower (cluster-2): `http://localhost:9201`
+- `os-cluster-1` (leader): `http://localhost:9200`
+- `os-cluster-2` (follower): `http://localhost:9201`

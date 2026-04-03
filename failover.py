@@ -3,7 +3,9 @@ import os
 import time
 
 import requests
+from config import load_env
 
+load_env()
 FOLLOWER = os.getenv("FOLLOWER_URL", "http://localhost:9201").rstrip("/")
 INDEX = os.getenv("CCR_INDEX", "rag_data")
 logging.basicConfig(

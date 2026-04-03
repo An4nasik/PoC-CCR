@@ -2,7 +2,9 @@ import logging
 import os
 
 import requests
+from config import load_env
 
+load_env()
 LEADER = os.getenv("LEADER_URL", "http://localhost:9200").rstrip("/")
 FOLLOWER = os.getenv("FOLLOWER_URL", "http://localhost:9201").rstrip("/")
 INDEX = os.getenv("CCR_INDEX", "rag_data")
