@@ -7,13 +7,14 @@
 Файл уже есть в проекте. При необходимости можешь обновить его по шаблону `.env.example`.
 
 Основные параметры:
-- `LEADER_URL`
-- `FOLLOWER_URL`
-- `CCR_INDEX`
-- `CCR_ALIAS`
-- `OPENSEARCH_URLS`
-- `PRODUCER_STRATEGY`
-- `FAILOVER_ERRORS_THRESHOLD`
+
+- `LEADER_URL` — адрес лидер кластера (по умолчанию `http://localhost:9200`)
+- `FOLLOWER_URL` — адрес фолловер кластера (по умолчанию `http://localhost:9201`)
+- `CCR_INDEX` — имя индекса для репликации (по умолчанию `rag_data`)
+- `CCR_ALIAS` — алиас удаленного кластера в follower (по умолчанию `leader-cluster`)
+- `OPENSEARCH_URLS` — список URL через запятую для распределения записей продюсером (по умолчанию оба кластера)
+- `PRODUCER_STRATEGY` — стратегия продюсера: `auto` (начинает round-robin, переходит в failover), `round_robin` или `failover`
+- `FAILOVER_ERRORS_THRESHOLD` — сколько подряд идущих ошибок до автопереключения в failover режим (по умолчанию 3)
 
 `PRODUCER_STRATEGY=auto` работает так:
 - старт в `round_robin`;
