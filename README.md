@@ -12,14 +12,19 @@
 - `FOLLOWER_URL` — адрес фолловер кластера (по умолчанию `http://localhost:9201`)
 - `CCR_INDEX` — имя индекса для репликации (по умолчанию `rag_data`)
 - `CCR_ALIAS` — алиас удаленного кластера в follower (по умолчанию `leader-cluster`)
-- `OPENSEARCH_URLS` — список URL через запятую для распределения записей продюсером (по умолчанию оба кластера)
-- `PRODUCER_STRATEGY` — стратегия продюсера: `auto` (начинает round-robin, переходит в failover), `round_robin` или `failover`
-- `FAILOVER_ERRORS_THRESHOLD` — сколько подряд идущих ошибок до автопереключения в failover режим (по умолчанию 3)
+- `OPENSEARCH_URLS` — список URL через запятую для producer и consumer (по умолчанию оба кластера)
+- `PRODUCER_RETRY_DELAY` — пауза при неуспешной записи (по умолчанию `1`)
+- `CONSUMER_POLL_INTERVAL` — интервал опроса индекса consumer-ом (по умолчанию `2`)
+- `CONSUMER_QUERY_SIZE` — сколько документов за один запрос читает consumer (по умолчанию `5`)
 
-`PRODUCER_STRATEGY=auto` работает так:
-- старт в `round_robin`;
-- после серии ошибок автоматическое переключение в `failover`;
-- в `failover` продюсер закрепляется на writable endpoint.
+Producer теперь работает в failover-only режиме:
+- определяет writable endpoint автоматически;
+- пишет только в writable endpoint;
+- при падении текущей точки записи переходит на новую writable точку.
+
+Consumer работает в round-robin режиме:
+- читает индекс по очереди с URL из `OPENSEARCH_URLS`;
+- при недоступности одного endpoint читает с другого.
 
 ## Быстрый запуск (Windows)
 
@@ -38,22 +43,27 @@ python setup.py
 python producer.py
 ```
 
-### 4) Проверить статус
+### 4) Запустить consumer (опционально)
+```powershell
+python consumer.py
+```
+
+### 5) Проверить статус
 ```powershell
 python check_status.py
 ```
 
-### 5) Эмулировать падение лидера
+### 6) Эмулировать падение лидера
 ```powershell
 docker stop os-cluster-1
 ```
 
-### 6) Выполнить failover
+### 7) Выполнить failover
 ```powershell
 python failover.py
 ```
 
-### 7) Проверить, что запись продолжается
+### 8) Проверить, что запись продолжается
 ```powershell
 python producer.py
 ```
@@ -77,7 +87,8 @@ python check_status.py
 - `docker-compose.yml` — два OpenSearch кластера
 - `config.py` — загрузка `.env`
 - `setup.py` — создание индекса и настройка CCR
-- `producer.py` — запись документов
+- `producer.py` — запись документов (автоопределение writable endpoint)
+- `consumer.py` — чтение документов в round-robin по endpoint-ам
 - `failover.py` — перевод follower в writable режим
 - `check_status.py` — проверка состояния кластеров и репликации
 - `run_all.ps1` — автоматический Stage-1 прогон

@@ -55,7 +55,7 @@ Write-Host "4) Setup CCR index=$($env:CCR_INDEX)"
 python setup.py
 
 Write-Host "5) Start producer on leader for 8 seconds"
-$env:OPENSEARCH_URL = "http://localhost:9200"
+$env:OPENSEARCH_URLS = "http://localhost:9200,http://localhost:9201"
 $leaderProducer = Start-Process python -ArgumentList "producer.py" -PassThru
 Start-Sleep -Seconds 8
 Stop-ProcessSafe -Id $leaderProducer.Id
@@ -73,7 +73,6 @@ Write-Host "7) Run failover"
 python failover.py
 
 Write-Host "8) Start producer on new leader for 8 seconds"
-$env:OPENSEARCH_URL = "http://localhost:9201"
 $followerProducer = Start-Process python -ArgumentList "producer.py" -PassThru
 Start-Sleep -Seconds 8
 Stop-ProcessSafe -Id $followerProducer.Id

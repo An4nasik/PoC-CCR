@@ -16,18 +16,10 @@ URLS = [
     ).split(",")
     if item.strip()
 ]
-STRATEGY = os.getenv("PRODUCER_STRATEGY", "auto").lower()
-FAILOVER_ERRORS_THRESHOLD = int(os.getenv("FAILOVER_ERRORS_THRESHOLD", "3"))
+PRODUCER_RETRY_DELAY = float(os.getenv("PRODUCER_RETRY_DELAY", "1"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-
-
-def endpoint_order(counter: int) -> list[str]:
-    if not URLS:
-        return []
-    start = counter % len(URLS)
-    return URLS[start:] + URLS[:start]
 
 
 def is_read_only_response(response: requests.Response) -> bool:
@@ -51,7 +43,10 @@ def write_once(endpoint: str, document: dict) -> tuple[bool, str]:
 def detect_writable_endpoint() -> str | None:
     for endpoint in URLS:
         try:
-            response = requests.get(f"{endpoint}/_plugins/_replication/{INDEX}/_status", timeout=3)
+            response = requests.get(
+                f"{endpoint}/_plugins/_replication/{INDEX}/_status",
+                timeout=3,
+            )
             if response.ok and response.json().get("status") == "REPLICATION NOT IN PROGRESS":
                 return endpoint
         except requests.exceptions.RequestException:
@@ -59,61 +54,65 @@ def detect_writable_endpoint() -> str | None:
     return None
 
 
-def write_round_robin(counter: int, document: dict) -> str | None:
-    for endpoint in endpoint_order(counter):
+def write_with_failover(counter: int, document: dict, active_endpoint: str | None) -> str | None:
+    endpoint = active_endpoint or detect_writable_endpoint()
+    if endpoint:
         ok, reason = write_once(endpoint, document)
         if ok:
-            log.info("written counter=%s ts=%s endpoint=%s", counter, document["timestamp"], endpoint)
+            log.info(
+                "written counter=%s ts=%s endpoint=%s",
+                counter,
+                document["timestamp"],
+                endpoint,
+            )
             return endpoint
         if reason == "read_only":
-            log.warning("endpoint is read-only endpoint=%s", endpoint)
+            log.warning("active endpoint is read-only endpoint=%s", endpoint)
         elif reason == "connection":
-            log.warning("endpoint is unavailable endpoint=%s", endpoint)
+            log.warning("active endpoint unavailable endpoint=%s", endpoint)
         else:
             log.warning("write failed endpoint=%s", endpoint)
-    return None
 
-
-def write_failover(counter: int, document: dict, active_endpoint: str | None) -> str | None:
-    endpoint = active_endpoint or detect_writable_endpoint()
-    if not endpoint:
-        for candidate in URLS:
-            ok, reason = write_once(candidate, document)
-            if ok:
-                log.info("written counter=%s ts=%s endpoint=%s", counter, document["timestamp"], candidate)
-                return candidate
-            if reason == "read_only":
-                log.warning("endpoint is read-only endpoint=%s", candidate)
-            elif reason == "connection":
-                log.warning("endpoint is unavailable endpoint=%s", candidate)
-            else:
-                log.warning("write failed endpoint=%s", candidate)
-        return None
-
-    ok, reason = write_once(endpoint, document)
-    if ok:
-        log.info("written counter=%s ts=%s endpoint=%s", counter, document["timestamp"], endpoint)
-        return endpoint
-
-    if reason == "read_only":
-        log.warning("active endpoint became read-only endpoint=%s", endpoint)
-    elif reason == "connection":
-        log.warning("active endpoint unavailable endpoint=%s", endpoint)
-    else:
-        log.warning("write failed endpoint=%s", endpoint)
-
-    fallback = detect_writable_endpoint()
-    if fallback and fallback != endpoint:
-        ok, reason = write_once(fallback, document)
+    for candidate in URLS:
+        if candidate == endpoint:
+            continue
+        ok, reason = write_once(candidate, document)
         if ok:
-            log.info("written counter=%s ts=%s endpoint=%s", counter, document["timestamp"], fallback)
-            return fallback
+            log.info(
+                "written counter=%s ts=%s endpoint=%s",
+                counter,
+                document["timestamp"],
+                candidate,
+            )
+            return candidate
         if reason == "read_only":
-            log.warning("fallback endpoint is read-only endpoint=%s", fallback)
+            log.warning("endpoint is read-only endpoint=%s", candidate)
         elif reason == "connection":
-            log.warning("fallback endpoint unavailable endpoint=%s", fallback)
+            log.warning("endpoint is unavailable endpoint=%s", candidate)
         else:
-            log.warning("write failed endpoint=%s", fallback)
+            log.warning("write failed endpoint=%s", candidate)
+
+    if endpoint:
+        rediscovered = detect_writable_endpoint()
+        if rediscovered and rediscovered != endpoint:
+            ok, reason = write_once(rediscovered, document)
+            if ok:
+                log.info(
+                    "written counter=%s ts=%s endpoint=%s",
+                    counter,
+                    document["timestamp"],
+                    rediscovered,
+                )
+                return rediscovered
+            if reason == "read_only":
+                log.warning("rediscovered endpoint is read-only endpoint=%s", rediscovered)
+            elif reason == "connection":
+                log.warning("rediscovered endpoint unavailable endpoint=%s", rediscovered)
+            else:
+                log.warning("write failed endpoint=%s", rediscovered)
+
+    if not endpoint:
+        log.warning("writable endpoint not detected for index=%s", INDEX)
 
     return None
 
@@ -122,11 +121,10 @@ def main() -> None:
     if not URLS:
         raise RuntimeError("No endpoints configured")
 
-    mode = "round_robin" if STRATEGY == "auto" else STRATEGY
-    active_endpoint = detect_writable_endpoint() if mode == "failover" else None
-    failures = 0
-
-    log.info("Producer started. Index=%s endpoints=%s strategy=%s", INDEX, URLS, mode)
+    active_endpoint = detect_writable_endpoint()
+    if active_endpoint:
+        log.info("Detected writable endpoint=%s", active_endpoint)
+    log.info("Producer started. Index=%s endpoints=%s mode=failover-only", INDEX, URLS)
 
     counter = 0
     while True:
@@ -136,23 +134,14 @@ def main() -> None:
             "data": f"document-{counter}",
         }
 
-        if mode == "failover":
-            selected = write_failover(counter, document, active_endpoint)
-        else:
-            selected = write_round_robin(counter, document)
-
+        selected = write_with_failover(counter, document, active_endpoint)
         if selected is None:
-            failures += 1
-            if mode == "round_robin" and failures >= FAILOVER_ERRORS_THRESHOLD:
-                mode = "failover"
-                active_endpoint = detect_writable_endpoint()
-                log.warning("Switching producer mode to failover after %s failures", failures)
             log.error("write failed on all endpoints counter=%s", counter)
+            time.sleep(PRODUCER_RETRY_DELAY)
         else:
-            failures = 0
             active_endpoint = selected
+            counter += 1
 
-        counter += 1
         time.sleep(1)
 
 
