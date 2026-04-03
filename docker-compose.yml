@@ -1,0 +1,58 @@
+services:
+  os-cluster-1:
+    image: opensearchproject/opensearch:2.11.1
+    container_name: os-cluster-1
+    environment:
+      - cluster.name=cluster-1
+      - node.name=os-cluster-1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - os-data-1:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - os-net
+
+  os-cluster-2:
+    image: opensearchproject/opensearch:2.11.1
+    container_name: os-cluster-2
+    environment:
+      - cluster.name=cluster-2
+      - node.name=os-cluster-2
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - os-data-2:/usr/share/opensearch/data
+    ports:
+      - "9201:9200"
+      - "9301:9300"
+    networks:
+      - os-net
+
+volumes:
+  os-data-1:
+  os-data-2:
+
+networks:
+  os-net:
+    driver: bridge
