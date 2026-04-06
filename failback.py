@@ -5,6 +5,12 @@ import time
 
 import requests
 
+from cluster_state import (
+    collect_cluster_snapshots,
+    current_epoch,
+    request_with_retry,
+    resolve_current_leader,
+)
 from config import load_env
 
 load_env()
@@ -17,47 +23,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def request_with_retry(method: str, url: str, retries: int = 5, **kwargs):
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.request(method, url, **kwargs)
-            return response
-        except requests.exceptions.RequestException as err:
-            last_error = err
-            log.warning("request failed attempt=%s/%s error=%s", attempt, retries, err)
-            time.sleep(2)
-    raise RuntimeError(f"Request failed after retries: {last_error}")
-
-
-def get_replication_status(url: str) -> str | None:
-    try:
-        response = requests.get(f"{url}/_plugins/_replication/{INDEX}/_status", timeout=5)
-        if response.ok:
-            return response.json().get("status")
-    except requests.exceptions.RequestException:
-        pass
-    return None
-
-
 def detect_current_leader() -> tuple[str, str]:
-    status_1 = get_replication_status(CLUSTER_1)
-    status_2 = get_replication_status(CLUSTER_2)
+    snapshots = collect_cluster_snapshots([CLUSTER_1, CLUSTER_2], INDEX)
+    for snapshot in snapshots:
+        log.info(
+            "endpoint=%s health=%s replication=%s epoch=%s leader_url=%s",
+            snapshot.url,
+            snapshot.health_status or "down",
+            snapshot.replication_status or "unknown",
+            snapshot.leader_epoch if snapshot.leader_epoch is not None else "n/a",
+            snapshot.leader_url or "n/a",
+        )
 
-    log.info("cluster-1 replication status=%s", status_1 or "unavailable")
-    log.info("cluster-2 replication status=%s", status_2 or "unavailable")
+    leader = resolve_current_leader(snapshots)
+    if not leader:
+        raise RuntimeError("Cannot determine current leader safely")
 
-    follower_statuses = {"SYNCING", "BOOTSTRAPPING", "PAUSED", None}
-    if status_2 == "REPLICATION NOT IN PROGRESS" and status_1 in follower_statuses:
-        return CLUSTER_2, CLUSTER_1
-    if status_1 == "REPLICATION NOT IN PROGRESS" and status_2 in follower_statuses:
-        return CLUSTER_1, CLUSTER_2
+    epoch = current_epoch(snapshots)
+    new_follower = CLUSTER_1 if leader.url == CLUSTER_2 else CLUSTER_2
+    follower_snapshot = next(snapshot for snapshot in snapshots if snapshot.url == new_follower)
+    if (
+        epoch is not None
+        and follower_snapshot.leader_epoch == epoch
+        and follower_snapshot.is_writable
+    ):
+        raise RuntimeError("Target follower is still writable on the current epoch")
 
-    if status_1 == "REPLICATION NOT IN PROGRESS" and status_2 == "REPLICATION NOT IN PROGRESS":
-        log.warning("both clusters have no active replication, assuming cluster-2 is leader")
-        return CLUSTER_2, CLUSTER_1
-
-    raise RuntimeError(f"Cannot determine leader. cluster-1={status_1}, cluster-2={status_2}")
+    return leader.url, new_follower
 
 
 def get_container_ip(container_name: str) -> str:
@@ -105,7 +97,13 @@ def main() -> None:
         return
 
     log.info("Deleting old index on new follower (%s)", new_follower)
-    response = request_with_retry("DELETE", f"{new_follower}/{INDEX}", timeout=10)
+    response = request_with_retry(
+        "DELETE",
+        f"{new_follower}/{INDEX}",
+        retries=5,
+        logger=log,
+        timeout=10,
+    )
     if response.ok:
         log.info("Old index deleted")
     elif response.status_code == 404 or "index_not_found" in response.text:
@@ -124,6 +122,8 @@ def main() -> None:
     response = request_with_retry(
         "PUT",
         f"{new_follower}/_cluster/settings",
+        retries=5,
+        logger=log,
         json={
             "persistent": {
                 "cluster": {"remote": {CONNECTION_ALIAS: {"seeds": [f"{leader_ip}:9300"]}}}
@@ -140,6 +140,8 @@ def main() -> None:
         response = request_with_retry(
             "PUT",
             f"{new_follower}/_plugins/_replication/{INDEX}/_start",
+            retries=5,
+            logger=log,
             json={"leader_alias": CONNECTION_ALIAS, "leader_index": INDEX},
             timeout=10,
         )
@@ -155,7 +157,7 @@ def main() -> None:
         raise RuntimeError("Failed to start replication after retries")
 
     time.sleep(2)
-    final_status = get_replication_status(new_follower)
+    final_status = collect_cluster_snapshots([new_follower], INDEX)[0].replication_status
     log.info("Replication status on new follower: %s", final_status or "unknown")
     log.info("Failback completed. Leader=%s, Follower=%s", current_leader, new_follower)
 

@@ -5,18 +5,21 @@ from datetime import UTC, datetime
 
 import requests
 
+from cluster_state import (
+    build_endpoints,
+    collect_cluster_snapshots,
+    current_generation_snapshots,
+    describe_role,
+    resolve_current_leader,
+)
 from config import load_env
 
 load_env()
 INDEX = os.getenv("CCR_INDEX", "rag_data")
-URLS = [
-    item.strip().rstrip("/")
-    for item in os.getenv(
-        "OPENSEARCH_URLS",
-        os.getenv("OPENSEARCH_URL", "http://localhost:9200,http://localhost:9201"),
-    ).split(",")
-    if item.strip()
-]
+URLS = build_endpoints(
+    os.getenv("OPENSEARCH_URLS"),
+    os.getenv("OPENSEARCH_URL", "http://localhost:9200,http://localhost:9201"),
+)
 PRODUCER_RETRY_DELAY = float(os.getenv("PRODUCER_RETRY_DELAY", "1"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -41,22 +44,39 @@ def write_once(endpoint: str, document: dict) -> tuple[bool, str]:
     return False, "error"
 
 
-def detect_writable_endpoint() -> str | None:
-    for endpoint in URLS:
-        try:
-            response = requests.get(
-                f"{endpoint}/_plugins/_replication/{INDEX}/_status",
-                timeout=3,
-            )
-            if response.ok and response.json().get("status") == "REPLICATION NOT IN PROGRESS":
-                return endpoint
-        except requests.exceptions.RequestException:
-            continue
-    return None
+def detect_writable_endpoint(active_endpoint: str | None) -> tuple[str | None, list]:
+    snapshots = collect_cluster_snapshots(URLS, INDEX)
+    leader = resolve_current_leader(snapshots)
+    if leader:
+        return leader.url, snapshots
+
+    if active_endpoint:
+        snapshot_by_url = {snapshot.url: snapshot for snapshot in snapshots}
+        active_snapshot = snapshot_by_url.get(active_endpoint)
+        current_urls = {snapshot.url for snapshot in current_generation_snapshots(snapshots)}
+        if active_snapshot and active_snapshot.is_writable and (
+            not current_urls or active_snapshot.url in current_urls
+        ):
+            return active_endpoint, snapshots
+
+    return None, snapshots
+
+
+def log_cluster_state(snapshots: list) -> None:
+    for snapshot in snapshots:
+        log.warning(
+            "state endpoint=%s role=%s health=%s replication=%s epoch=%s leader_url=%s",
+            snapshot.url,
+            describe_role(snapshot, snapshots),
+            snapshot.health_status or "down",
+            snapshot.replication_status or "unknown",
+            snapshot.leader_epoch if snapshot.leader_epoch is not None else "n/a",
+            snapshot.leader_url or "n/a",
+        )
 
 
 def write_with_failover(counter: int, document: dict, active_endpoint: str | None) -> str | None:
-    endpoint = active_endpoint or detect_writable_endpoint()
+    endpoint, snapshots = detect_writable_endpoint(active_endpoint)
     if endpoint:
         ok, reason = write_once(endpoint, document)
         if ok:
@@ -68,52 +88,14 @@ def write_with_failover(counter: int, document: dict, active_endpoint: str | Non
             )
             return endpoint
         if reason == "read_only":
-            log.warning("active endpoint is read-only endpoint=%s", endpoint)
+            log.warning("selected endpoint is read-only endpoint=%s", endpoint)
         elif reason == "connection":
-            log.warning("active endpoint unavailable endpoint=%s", endpoint)
+            log.warning("selected endpoint unavailable endpoint=%s", endpoint)
         else:
             log.warning("write failed endpoint=%s", endpoint)
 
-    for candidate in URLS:
-        if candidate == endpoint:
-            continue
-        ok, reason = write_once(candidate, document)
-        if ok:
-            log.info(
-                "written counter=%s ts=%s endpoint=%s",
-                counter,
-                document["timestamp"],
-                candidate,
-            )
-            return candidate
-        if reason == "read_only":
-            log.warning("endpoint is read-only endpoint=%s", candidate)
-        elif reason == "connection":
-            log.warning("endpoint is unavailable endpoint=%s", candidate)
-        else:
-            log.warning("write failed endpoint=%s", candidate)
-
-    if endpoint:
-        rediscovered = detect_writable_endpoint()
-        if rediscovered and rediscovered != endpoint:
-            ok, reason = write_once(rediscovered, document)
-            if ok:
-                log.info(
-                    "written counter=%s ts=%s endpoint=%s",
-                    counter,
-                    document["timestamp"],
-                    rediscovered,
-                )
-                return rediscovered
-            if reason == "read_only":
-                log.warning("rediscovered endpoint is read-only endpoint=%s", rediscovered)
-            elif reason == "connection":
-                log.warning("rediscovered endpoint unavailable endpoint=%s", rediscovered)
-            else:
-                log.warning("write failed endpoint=%s", rediscovered)
-
-    if not endpoint:
-        log.warning("writable endpoint not detected for index=%s", INDEX)
+    log.warning("writable endpoint not confirmed for index=%s", INDEX)
+    log_cluster_state(snapshots)
 
     return None
 
@@ -122,7 +104,7 @@ def main() -> None:
     if not URLS:
         raise RuntimeError("No endpoints configured")
 
-    active_endpoint = detect_writable_endpoint()
+    active_endpoint, _ = detect_writable_endpoint(None)
     if active_endpoint:
         log.info("Detected writable endpoint=%s", active_endpoint)
     log.info("Producer started. Index=%s endpoints=%s mode=failover-only", INDEX, URLS)

@@ -1,8 +1,7 @@
 import logging
 import os
 
-import requests
-
+from cluster_state import collect_cluster_snapshots, describe_role
 from config import load_env
 
 load_env()
@@ -15,51 +14,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-def check_cluster(url: str, name: str) -> None:
-    log.info("cluster=%s url=%s", name, url)
-    try:
-        health_response = requests.get(f"{url}/_cluster/health", timeout=3)
-        if not health_response.ok:
-            log.error("cluster unavailable")
-            return
-        health = health_response.json()
-        log.info("health=%s", health.get("status", "unknown"))
-    except requests.exceptions.RequestException as err:
-        log.error("cluster unavailable error=%s", err)
-        return
-
-    try:
-        count_response = requests.get(f"{url}/{INDEX}/_count", timeout=3)
-        if count_response.ok:
-            count = count_response.json().get("count", 0)
-            log.info("index=%s count=%s", INDEX, count)
-        else:
-            log.info("index=%s not found", INDEX)
-    except requests.exceptions.RequestException as err:
-        log.error("count request failed error=%s", err)
-
-    try:
-        status_response = requests.get(f"{url}/_plugins/_replication/{INDEX}/_status", timeout=3)
-        if status_response.ok:
-            data = status_response.json()
-            status = data.get("status", "unknown")
-            log.info("replication_status=%s", status)
-            if "syncing_details" in data:
-                details = data["syncing_details"]
-                log.info(
-                    "leader_checkpoint=%s follower_checkpoint=%s",
-                    details.get("leader_checkpoint", "N/A"),
-                    details.get("follower_checkpoint", "N/A"),
-                )
-    except requests.exceptions.RequestException:
-        log.info("replication status endpoint not available")
-
-
 def main() -> None:
     log.info("CCR status")
-    check_cluster(LEADER, "LEADER (cluster-1)")
-    check_cluster(FOLLOWER, "FOLLOWER (cluster-2)")
+    snapshots = collect_cluster_snapshots([LEADER, FOLLOWER], INDEX, include_counts=True)
+    labels = {
+        LEADER: "cluster-1",
+        FOLLOWER: "cluster-2",
+    }
+    for snapshot in snapshots:
+        log.info("cluster=%s url=%s", labels.get(snapshot.url, snapshot.url), snapshot.url)
+        if not snapshot.healthy:
+            log.error("cluster unavailable error=%s", snapshot.error or "unknown")
+            continue
+        count = snapshot.data_count if snapshot.data_count is not None else "n/a"
+        leader_epoch = snapshot.leader_epoch if snapshot.leader_epoch is not None else "n/a"
+        log.info("health=%s", snapshot.health_status or "unknown")
+        log.info("role=%s", describe_role(snapshot, snapshots))
+        log.info("index=%s count=%s", INDEX, count)
+        log.info("replication_status=%s", snapshot.replication_status or "unknown")
+        log.info("leader_epoch=%s", leader_epoch)
+        log.info("leader_url=%s", snapshot.leader_url or "n/a")
 
 
 if __name__ == "__main__":

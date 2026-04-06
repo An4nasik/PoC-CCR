@@ -8,6 +8,13 @@ if (-not $env:CCR_INDEX) {
     $env:CCR_INDEX = "rag_data"
 }
 
+$metaDocId = "__ccr_meta__"
+$pythonExe = if (Test-Path -LiteralPath ".\.venv\Scripts\python.exe") {
+    (Resolve-Path ".\.venv\Scripts\python.exe").Path
+} else {
+    "python"
+}
+
 function Wait-Cluster {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -31,67 +38,131 @@ function Stop-ProcessSafe {
     param(
         [Parameter(Mandatory = $true)][int]$Id
     )
+
     if (Get-Process -Id $Id -ErrorAction SilentlyContinue) {
         Stop-Process -Id $Id
     }
 }
 
-Write-Host "1) Install python dependency"
-try {
-    python -m pip install requests --disable-pip-version-check -q
-} catch {
-    Write-Host "Skip pip install. Using existing python environment."
+function Assert-ProcessAlive {
+    param(
+        [Parameter(Mandatory = $true)][int]$Id,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not (Get-Process -Id $Id -ErrorAction SilentlyContinue)) {
+        throw "$Name exited unexpectedly"
+    }
 }
 
-Write-Host "2) Reset and start docker stack"
-docker compose down -v | Out-Null
-docker compose up -d | Out-Null
+function Get-DataCount {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url
+    )
 
-Write-Host "3) Wait clusters"
-Wait-Cluster -Url "http://localhost:9200"
-Wait-Cluster -Url "http://localhost:9201"
+    $body = @{
+        query = @{
+            bool = @{
+                must_not = @(
+                    @{
+                        ids = @{
+                            values = @($metaDocId)
+                        }
+                    }
+                )
+            }
+        }
+    } | ConvertTo-Json -Depth 8
 
-Write-Host "4) Setup CCR index=$($env:CCR_INDEX)"
-python setup.py
-
-Write-Host "5) Start producer on leader for 8 seconds"
-$env:OPENSEARCH_URLS = "http://localhost:9200,http://localhost:9201"
-$leaderProducer = Start-Process python -ArgumentList "producer.py" -PassThru
-Start-Sleep -Seconds 8
-Stop-ProcessSafe -Id $leaderProducer.Id
-Start-Sleep -Seconds 2
-
-$beforeLeader = (Invoke-RestMethod -Uri "http://localhost:9200/$($env:CCR_INDEX)/_count" -TimeoutSec 8).count
-$beforeFollower = (Invoke-RestMethod -Uri "http://localhost:9201/$($env:CCR_INDEX)/_count" -TimeoutSec 8).count
-Write-Host "Counts before failover: leader=$beforeLeader follower=$beforeFollower"
-
-Write-Host "6) Simulate leader outage"
-docker stop os-cluster-1 | Out-Null
-Start-Sleep -Seconds 3
-
-Write-Host "7) Run failover"
-python failover.py
-
-Write-Host "8) Start producer on new leader for 8 seconds"
-$followerProducer = Start-Process python -ArgumentList "producer.py" -PassThru
-Start-Sleep -Seconds 8
-Stop-ProcessSafe -Id $followerProducer.Id
-Start-Sleep -Seconds 2
-
-$afterFollower = (Invoke-RestMethod -Uri "http://localhost:9201/$($env:CCR_INDEX)/_count" -TimeoutSec 8).count
-$statusFollower = (Invoke-RestMethod -Uri "http://localhost:9201/_plugins/_replication/$($env:CCR_INDEX)/_status" -TimeoutSec 8).status
-
-$leaderState = "up"
-try {
-    $null = Invoke-RestMethod -Uri "http://localhost:9200/_cluster/health" -TimeoutSec 3
-} catch {
-    $leaderState = "down"
+    return (
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri "$Url/$($env:CCR_INDEX)/_count" `
+            -TimeoutSec 8 `
+            -ContentType "application/json" `
+            -Body $body
+    ).count
 }
 
-Write-Host "9) Final check"
-Write-Host "cluster-1=$leaderState"
-Write-Host "cluster-2 replication status=$statusFollower"
-Write-Host "cluster-2 documents=$afterFollower"
-python check_status.py
+function Invoke-Python {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
 
-Write-Host "Done"
+    & $pythonExe @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python command failed: $($Arguments -join ' ')"
+    }
+}
+
+$producer = $null
+$consumer = $null
+
+try {
+    Write-Host "1) Reset and start docker stack"
+    docker compose down -v | Out-Null
+    docker compose up -d | Out-Null
+
+    Write-Host "2) Wait clusters"
+    Wait-Cluster -Url "http://localhost:9200"
+    Wait-Cluster -Url "http://localhost:9201"
+
+    Write-Host "3) Setup CCR index=$($env:CCR_INDEX)"
+    Invoke-Python -Arguments @(".\setup.py")
+
+    Write-Host "4) Start producer and consumer"
+    $env:OPENSEARCH_URLS = "http://localhost:9200,http://localhost:9201"
+    $producer = Start-Process -FilePath $pythonExe -ArgumentList "producer.py" -PassThru
+    $consumer = Start-Process -FilePath $pythonExe -ArgumentList "consumer.py" -PassThru
+    Start-Sleep -Seconds 8
+    Assert-ProcessAlive -Id $producer.Id -Name "producer"
+    Assert-ProcessAlive -Id $consumer.Id -Name "consumer"
+
+    $beforeLeader = Get-DataCount -Url "http://localhost:9200"
+    $beforeFollower = Get-DataCount -Url "http://localhost:9201"
+    Write-Host "Counts before failover: cluster-1=$beforeLeader cluster-2=$beforeFollower"
+
+    Write-Host "5) Simulate leader outage and failover to cluster-2"
+    docker stop os-cluster-1 | Out-Null
+    Start-Sleep -Seconds 3
+    Invoke-Python -Arguments @(".\failover.py")
+    Start-Sleep -Seconds 6
+    Assert-ProcessAlive -Id $producer.Id -Name "producer"
+    Assert-ProcessAlive -Id $consumer.Id -Name "consumer"
+
+    $afterFirstFailover = Get-DataCount -Url "http://localhost:9201"
+    Write-Host "Count after first failover: cluster-2=$afterFirstFailover"
+
+    Write-Host "6) Restore cluster-1 and run failback"
+    docker start os-cluster-1 | Out-Null
+    Wait-Cluster -Url "http://localhost:9200"
+    Invoke-Python -Arguments @(".\failback.py")
+    Start-Sleep -Seconds 6
+    Assert-ProcessAlive -Id $producer.Id -Name "producer"
+    Assert-ProcessAlive -Id $consumer.Id -Name "consumer"
+
+    $afterFailbackLeader = Get-DataCount -Url "http://localhost:9200"
+    $afterFailbackFollower = Get-DataCount -Url "http://localhost:9201"
+    Write-Host "Counts after failback: cluster-1=$afterFailbackLeader cluster-2=$afterFailbackFollower"
+
+    Write-Host "7) Simulate leader outage on cluster-2 and failover back to cluster-1"
+    docker stop os-cluster-2 | Out-Null
+    Start-Sleep -Seconds 3
+    Invoke-Python -Arguments @(".\failover.py")
+    Start-Sleep -Seconds 6
+    Assert-ProcessAlive -Id $producer.Id -Name "producer"
+    Assert-ProcessAlive -Id $consumer.Id -Name "consumer"
+
+    $finalCount = Get-DataCount -Url "http://localhost:9200"
+    Write-Host "8) Final check"
+    Write-Host "cluster-1 documents=$finalCount"
+    Invoke-Python -Arguments @(".\check_status.py")
+    Write-Host "Done"
+} finally {
+    if ($producer) {
+        Stop-ProcessSafe -Id $producer.Id
+    }
+    if ($consumer) {
+        Stop-ProcessSafe -Id $consumer.Id
+    }
+}

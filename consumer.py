@@ -4,18 +4,20 @@ import time
 
 import requests
 
+from cluster_state import (
+    build_endpoints,
+    collect_cluster_snapshots,
+    current_generation_snapshots,
+    data_search_query,
+)
 from config import load_env
 
 load_env()
 INDEX = os.getenv("CCR_INDEX", "rag_data")
-URLS = [
-    item.strip().rstrip("/")
-    for item in os.getenv(
-        "OPENSEARCH_URLS",
-        os.getenv("OPENSEARCH_URL", "http://localhost:9200,http://localhost:9201"),
-    ).split(",")
-    if item.strip()
-]
+URLS = build_endpoints(
+    os.getenv("OPENSEARCH_URLS"),
+    os.getenv("OPENSEARCH_URL", "http://localhost:9200,http://localhost:9201"),
+)
 POLL_INTERVAL = float(os.getenv("CONSUMER_POLL_INTERVAL", "2"))
 QUERY_SIZE = int(os.getenv("CONSUMER_QUERY_SIZE", "5"))
 LAST_TIMESTAMP = ""
@@ -24,31 +26,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def endpoint_order(counter: int) -> list[str]:
-    if not URLS:
-        return []
-    start = counter % len(URLS)
-    return URLS[start:] + URLS[:start]
+def endpoint_order(counter: int) -> tuple[list[str], list]:
+    snapshots = collect_cluster_snapshots(URLS, INDEX)
+    current_urls = [snapshot.url for snapshot in current_generation_snapshots(snapshots)]
+    if not current_urls:
+        current_urls = [snapshot.url for snapshot in snapshots if snapshot.healthy]
+    if not current_urls:
+        return [], snapshots
+    start = counter % len(current_urls)
+    return current_urls[start:] + current_urls[:start], snapshots
 
 
 def build_query() -> dict:
-    if LAST_TIMESTAMP:
-        return {
-            "size": QUERY_SIZE,
-            "sort": [{"timestamp": "asc"}],
-            "query": {
-                "range": {
-                    "timestamp": {
-                        "gt": LAST_TIMESTAMP,
-                    }
-                }
-            },
-        }
-    return {
-        "size": QUERY_SIZE,
-        "sort": [{"timestamp": "asc"}],
-        "query": {"match_all": {}},
-    }
+    return data_search_query(LAST_TIMESTAMP, QUERY_SIZE)
 
 
 def read_once(endpoint: str) -> tuple[bool, list[dict]]:
@@ -86,9 +76,11 @@ def main() -> None:
     global LAST_TIMESTAMP
 
     while True:
-        endpoint, hits = consume_from(endpoint_order(cycle))
+        ordered_endpoints, snapshots = endpoint_order(cycle)
+        endpoint, hits = consume_from(ordered_endpoints)
         if endpoint is None:
-            log.error("consumer failed on all endpoints")
+            healthy_endpoints = [snapshot.url for snapshot in snapshots if snapshot.healthy]
+            log.error("consumer failed on all endpoints healthy=%s", healthy_endpoints)
             time.sleep(POLL_INTERVAL)
             continue
 

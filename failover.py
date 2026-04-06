@@ -2,8 +2,14 @@ import logging
 import os
 import time
 
-import requests
-
+from cluster_state import (
+    bump_leader_metadata,
+    collect_cluster_snapshots,
+    describe_role,
+    request_with_retry,
+    resolve_current_leader,
+    resolve_follower_candidate,
+)
 from config import load_env
 
 load_env()
@@ -19,63 +25,39 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def request_with_retry(method: str, url: str, retries: int = 8, **kwargs):
-    last_error = None
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.request(method, url, **kwargs)
-            return response
-        except requests.exceptions.RequestException as err:
-            last_error = err
-            log.warning("request failed attempt=%s/%s error=%s", attempt, retries, err)
-            time.sleep(2)
-    raise RuntimeError(f"Request failed after retries: {last_error}")
-
-
-def get_replication_status(url: str) -> str | None:
-    try:
-        response = requests.get(f"{url}/_plugins/_replication/{INDEX}/_status", timeout=10)
-        if response.ok:
-            return response.json().get("status")
-        if response.status_code == 500:
-            return "ERROR"
-    except requests.exceptions.RequestException:
-        pass
-    return None
-
-
-def detect_follower() -> str | None:
-    """Find a live endpoint that has replication (not already a leader)."""
+def detect_follower() -> tuple[str | None, list]:
     for _ in range(60):
-        for endpoint in ENDPOINTS:
-            try:
-                r = requests.get(f"{endpoint}/_cluster/health", timeout=3)
-                if not r.ok:
-                    continue
-            except requests.exceptions.RequestException:
-                continue
+        snapshots = collect_cluster_snapshots(ENDPOINTS, INDEX)
+        follower = resolve_follower_candidate(snapshots)
+        if follower:
+            return follower.url, snapshots
 
-            status = get_replication_status(endpoint)
-            if status is None:
-                continue
-            log.info("endpoint=%s status=%s", endpoint, status)
-            if status not in {"REPLICATION NOT IN PROGRESS", None}:
-                return endpoint
+        leader = resolve_current_leader(snapshots)
+        if leader:
+            return None, snapshots
         time.sleep(1)
-    return None
+    return None, collect_cluster_snapshots(ENDPOINTS, INDEX)
 
 
 def main() -> None:
     log.info("Failover started")
 
-    follower = detect_follower()
+    follower, snapshots = detect_follower()
     if not follower:
-        log.info("No active follower found, checking for already promoted endpoints")
-        for endpoint in ENDPOINTS:
-            status = get_replication_status(endpoint)
-            if status == "REPLICATION NOT IN PROGRESS":
-                log.info("endpoint=%s is already writable", endpoint)
-                return
+        leader = resolve_current_leader(snapshots)
+        if leader:
+            log.info("endpoint=%s is already writable", leader.url)
+            return
+        for snapshot in snapshots:
+            log.warning(
+                "state endpoint=%s role=%s health=%s replication=%s epoch=%s leader_url=%s",
+                snapshot.url,
+                describe_role(snapshot, snapshots),
+                snapshot.health_status or "down",
+                snapshot.replication_status or "unknown",
+                snapshot.leader_epoch if snapshot.leader_epoch is not None else "n/a",
+                snapshot.leader_url or "n/a",
+            )
         raise RuntimeError("Cannot determine follower to promote")
 
     log.info("Detected follower to promote: %s", follower)
@@ -83,62 +65,56 @@ def main() -> None:
     response = request_with_retry(
         "GET",
         f"{follower}/_plugins/_replication/{INDEX}/_status",
+        retries=8,
+        logger=log,
         timeout=10,
     )
+    should_stop_replication = True
     if response.ok:
         status = response.json().get("status", "unknown")
         log.info("current replication status=%s", status)
         if status == "REPLICATION NOT IN PROGRESS":
             log.info("replication already stopped")
-            return
+            should_stop_replication = False
     else:
         log.warning("status unavailable: %s", response.text[:160])
 
-    log.info("pausing replication")
-    response = request_with_retry(
-        "POST",
-        f"{follower}/_plugins/_replication/{INDEX}/_pause",
-        json={},
-        timeout=10,
-    )
-    if response.ok:
-        log.info("replication paused")
-    else:
-        log.warning("pause request failed: %s", response.text[:160])
+    if should_stop_replication:
+        log.info("pausing replication")
+        response = request_with_retry(
+            "POST",
+            f"{follower}/_plugins/_replication/{INDEX}/_pause",
+            json={},
+            retries=8,
+            logger=log,
+            timeout=10,
+        )
+        if response.ok:
+            log.info("replication paused")
+        else:
+            log.warning("pause request failed: %s", response.text[:160])
 
-    log.info("stopping replication")
-    response = request_with_retry(
-        "POST",
-        f"{follower}/_plugins/_replication/{INDEX}/_stop",
-        json={},
-        timeout=10,
-    )
-    if response.ok:
-        log.info("replication stopped")
-    elif "No replication in progress" in response.text:
-        log.info("replication already stopped")
-    else:
-        raise RuntimeError(f"Failed to stop replication: {response.text}")
+        log.info("stopping replication")
+        response = request_with_retry(
+            "POST",
+            f"{follower}/_plugins/_replication/{INDEX}/_stop",
+            json={},
+            retries=8,
+            logger=log,
+            timeout=10,
+        )
+        if response.ok:
+            log.info("replication stopped")
+        elif "No replication in progress" in response.text:
+            log.info("replication already stopped")
+        else:
+            raise RuntimeError(f"Failed to stop replication: {response.text}")
 
-    log.info("verifying status")
-    status_response = request_with_retry(
-        "GET",
-        f"{follower}/_plugins/_replication/{INDEX}/_status",
-        timeout=10,
-    )
-    status = status_response.json().get("status", "unknown") if status_response.ok else "unknown"
-    log.info("status after stop=%s", status)
-
-    log.info("verifying writes")
-    write_response = request_with_retry(
-        "POST",
-        f"{follower}/{INDEX}/_doc",
-        json={"test": "failover_check"},
-        timeout=10,
-    )
-    if not write_response.ok:
-        raise RuntimeError(f"Index is not writable: {write_response.text}")
-    log.info("write check successful")
+    log.info("bumping leader metadata")
+    metadata_response = bump_leader_metadata(follower, INDEX, timeout=10)
+    if not metadata_response.ok:
+        raise RuntimeError(f"Failed to write leader metadata: {metadata_response.text}")
+    log.info("leader metadata updated")
     log.info("Failover completed. New leader=%s", follower)
 
 

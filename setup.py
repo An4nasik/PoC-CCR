@@ -5,6 +5,7 @@ import time
 
 import requests
 
+from cluster_state import request_with_retry, write_leader_metadata
 from config import load_env
 
 load_env()
@@ -74,8 +75,11 @@ def delete_follower_index() -> None:
 def start_replication() -> None:
     response = None
     for attempt in range(1, 11):
-        response = requests.put(
+        response = request_with_retry(
+            "PUT",
             f"{FOLLOWER}/_plugins/_replication/{INDEX}/_start",
+            retries=5,
+            logger=log,
             json={"leader_alias": CONNECTION_ALIAS, "leader_index": INDEX},
             timeout=10,
         )
@@ -110,10 +114,24 @@ def main() -> None:
     else:
         raise RuntimeError(f"Failed to create index: {response.text}")
 
+    metadata_response = write_leader_metadata(
+        LEADER,
+        INDEX,
+        leader_epoch=1,
+        leader_url=LEADER,
+        timeout=10,
+    )
+    if not metadata_response.ok:
+        raise RuntimeError(f"Failed to initialize leader metadata: {metadata_response.text}")
+    log.info("Leader metadata initialized")
+
     leader_ip = get_leader_ip()
     log.info("Configuring remote connection with seed %s:9300", leader_ip)
-    response = requests.put(
+    response = request_with_retry(
+        "PUT",
         f"{FOLLOWER}/_cluster/settings",
+        retries=5,
+        logger=log,
         json={
             "persistent": {
                 "cluster": {"remote": {CONNECTION_ALIAS: {"seeds": [f"{leader_ip}:9300"]}}}

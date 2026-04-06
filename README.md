@@ -71,6 +71,12 @@ python producer.py
 powershell -ExecutionPolicy Bypass -File .\run_all.ps1
 ```
 
+`run_all.ps1` теперь гоняет producer и consumer без рестарта через полный цикл:
+- старт CCR;
+- failover на `cluster-2`;
+- failback с возвратом `cluster-1` в follower;
+- повторный failover обратно на `cluster-1`.
+
 ## Смена индекса
 
 Меняешь `CCR_INDEX` в `.env` и повторно запускаешь:
@@ -89,7 +95,7 @@ python check_status.py
 - `failover.py` — перевод follower в writable режим
 - `failback.py` — понижение старого leader до follower (обратная репликация)
 - `check_status.py` — проверка состояния кластеров и репликации
-- `run_all.ps1` — автоматический Stage-1 прогон
+- `run_all.ps1` — автоматический multi-cycle smoke прогон без рестарта producer/consumer
 
 ## Порты
 - `os-cluster-1` (leader): `http://localhost:9200`
