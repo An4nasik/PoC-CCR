@@ -7,8 +7,11 @@ import requests
 from config import load_env
 
 load_env()
-FOLLOWER = os.getenv("FOLLOWER_URL", "http://localhost:9201").rstrip("/")
+CLUSTER_1 = os.getenv("LEADER_URL", "http://localhost:9200").rstrip("/")
+CLUSTER_2 = os.getenv("FOLLOWER_URL", "http://localhost:9201").rstrip("/")
 INDEX = os.getenv("CCR_INDEX", "rag_data")
+ENDPOINTS = [CLUSTER_1, CLUSTER_2]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -29,11 +32,57 @@ def request_with_retry(method: str, url: str, retries: int = 8, **kwargs):
     raise RuntimeError(f"Request failed after retries: {last_error}")
 
 
+def get_replication_status(url: str) -> str | None:
+    try:
+        response = requests.get(f"{url}/_plugins/_replication/{INDEX}/_status", timeout=10)
+        if response.ok:
+            return response.json().get("status")
+        if response.status_code == 500:
+            return "ERROR"
+    except requests.exceptions.RequestException:
+        pass
+    return None
+
+
+def detect_follower() -> str | None:
+    """Find a live endpoint that has replication (not already a leader)."""
+    for _ in range(60):
+        for endpoint in ENDPOINTS:
+            try:
+                r = requests.get(f"{endpoint}/_cluster/health", timeout=3)
+                if not r.ok:
+                    continue
+            except requests.exceptions.RequestException:
+                continue
+
+            status = get_replication_status(endpoint)
+            if status is None:
+                continue
+            log.info("endpoint=%s status=%s", endpoint, status)
+            if status not in {"REPLICATION NOT IN PROGRESS", None}:
+                return endpoint
+        time.sleep(1)
+    return None
+
+
 def main() -> None:
     log.info("Failover started")
+
+    follower = detect_follower()
+    if not follower:
+        log.info("No active follower found, checking for already promoted endpoints")
+        for endpoint in ENDPOINTS:
+            status = get_replication_status(endpoint)
+            if status == "REPLICATION NOT IN PROGRESS":
+                log.info("endpoint=%s is already writable", endpoint)
+                return
+        raise RuntimeError("Cannot determine follower to promote")
+
+    log.info("Detected follower to promote: %s", follower)
+
     response = request_with_retry(
         "GET",
-        f"{FOLLOWER}/_plugins/_replication/{INDEX}/_status",
+        f"{follower}/_plugins/_replication/{INDEX}/_status",
         timeout=10,
     )
     if response.ok:
@@ -48,7 +97,7 @@ def main() -> None:
     log.info("pausing replication")
     response = request_with_retry(
         "POST",
-        f"{FOLLOWER}/_plugins/_replication/{INDEX}/_pause",
+        f"{follower}/_plugins/_replication/{INDEX}/_pause",
         json={},
         timeout=10,
     )
@@ -60,7 +109,7 @@ def main() -> None:
     log.info("stopping replication")
     response = request_with_retry(
         "POST",
-        f"{FOLLOWER}/_plugins/_replication/{INDEX}/_stop",
+        f"{follower}/_plugins/_replication/{INDEX}/_stop",
         json={},
         timeout=10,
     )
@@ -74,7 +123,7 @@ def main() -> None:
     log.info("verifying status")
     status_response = request_with_retry(
         "GET",
-        f"{FOLLOWER}/_plugins/_replication/{INDEX}/_status",
+        f"{follower}/_plugins/_replication/{INDEX}/_status",
         timeout=10,
     )
     status = status_response.json().get("status", "unknown") if status_response.ok else "unknown"
@@ -83,14 +132,14 @@ def main() -> None:
     log.info("verifying writes")
     write_response = request_with_retry(
         "POST",
-        f"{FOLLOWER}/{INDEX}/_doc",
+        f"{follower}/{INDEX}/_doc",
         json={"test": "failover_check"},
         timeout=10,
     )
     if not write_response.ok:
         raise RuntimeError(f"Index is not writable: {write_response.text}")
     log.info("write check successful")
-    log.info("Failover completed. Use OPENSEARCH_URL=%s", FOLLOWER)
+    log.info("Failover completed. New leader=%s", follower)
 
 
 if __name__ == "__main__":
