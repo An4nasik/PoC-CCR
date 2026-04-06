@@ -87,6 +87,7 @@ python check_status.py
 - `producer.py` — запись документов (автоопределение writable endpoint)
 - `consumer.py` — чтение документов в round-robin по endpoint-ам
 - `failover.py` — перевод follower в writable режим
+- `failback.py` — понижение старого leader до follower (обратная репликация)
 - `check_status.py` — проверка состояния кластеров и репликации
 - `run_all.ps1` — автоматический Stage-1 прогон
 
@@ -95,7 +96,33 @@ python check_status.py
 - `os-cluster-2` (follower): `http://localhost:9201`
 
 
+## Этап 2: Failback
+
+После восстановления старого лидера (cluster-1) можно понизить его до follower:
+
+### 1) Поднять старый кластер
+```powershell
+docker start os-cluster-1
+```
+
+### 2) Выполнить failback
+```powershell
+python failback.py
+```
+
+Скрипт автоматически:
+- Определяет текущий leader по статусу репликации
+- Удаляет устаревший индекс на cluster-1
+- Настраивает обратную репликацию: cluster-1 становится follower для cluster-2
+
+### 3) Проверить статус
+```powershell
+python check_status.py
+```
+
+Producer автоматически продолжит писать в текущий leader (cluster-2).
+
 ## Дополительно
 - Мы теряем часть запросов на запись во время переключения между master и follower 
-- failower -эмулирует проверку недоступности сервера, на проде по идее должно происходить иначе
-- follower отстает примерна на 0.5 секунды от master по данным
+- failover эмулирует проверку недоступности сервера, на проде по идее должно происходить иначе
+- follower отстает примерно на 0.5 секунды от master по данным

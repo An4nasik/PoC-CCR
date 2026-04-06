@@ -4,6 +4,7 @@ import time
 from datetime import UTC, datetime
 
 import requests
+
 from config import load_env
 
 load_env()
