@@ -1,5 +1,8 @@
 # PoC OpenSearch Cross-Cluster Replication
 
+README описывает текущее поведение проекта и сценарии запуска. История заметных изменений вынесена в
+[`changes.md`](./changes.md), чтобы рабочая инструкция не зависела от того, кто помнит прошлую версию.
+
 ## Конфигурация
 
 Все скрипты читают параметры из `.env`.
@@ -71,7 +74,7 @@ python producer.py
 powershell -ExecutionPolicy Bypass -File .\run_all.ps1
 ```
 
-`run_all.ps1` теперь гоняет producer и consumer без рестарта через полный цикл:
+`run_all.ps1` выполняет полный smoke-сценарий без перезапуска `producer.py` и `consumer.py`:
 - старт CCR;
 - failover на `cluster-2`;
 - failback с возвратом `cluster-1` в follower;
@@ -79,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File .\run_all.ps1
 
 ## Смена индекса
 
-Меняешь `CCR_INDEX` в `.env` и повторно запускаешь:
+Чтобы использовать другой индекс, обновите `CCR_INDEX` в `.env` и повторно запустите:
 
 ```powershell
 python setup.py
@@ -102,9 +105,9 @@ python check_status.py
 - `os-cluster-2` (follower): `http://localhost:9201`
 
 
-## Этап 2: Failback
+## Failback после восстановления `cluster-1`
 
-После восстановления старого лидера (cluster-1) можно понизить его до follower:
+После восстановления `cluster-1` можно вернуть его в роль follower:
 
 ### 1) Поднять старый кластер
 ```powershell
@@ -117,18 +120,19 @@ python failback.py
 ```
 
 Скрипт автоматически:
-- Определяет текущий leader по статусу репликации
-- Удаляет устаревший индекс на cluster-1
-- Настраивает обратную репликацию: cluster-1 становится follower для cluster-2
+- определяет текущий leader по статусу репликации;
+- удаляет устаревший индекс на `cluster-1`;
+- настраивает обратную репликацию, в которой `cluster-1` становится follower для `cluster-2`.
 
 ### 3) Проверить статус
 ```powershell
 python check_status.py
 ```
 
-Producer автоматически продолжит писать в текущий leader (cluster-2).
+После failback запись остается на `cluster-2`, пока он остается writable-кластером.
 
-## Дополительно
-- Мы теряем часть запросов на запись во время переключения между master и follower 
-- failover эмулирует проверку недоступности сервера, на проде по идее должно происходить иначе
-- follower отстает примерно на 0.5 секунды от master по данным
+## Дополнительно
+- Во время переключения между leader и follower возможна потеря части запросов на запись.
+- В этом PoC failover запускается вручную после проверки недоступности кластера. В production такую
+  логику обычно выносят в отдельный механизм оркестрации или health-check.
+- Follower может отставать от leader примерно на 0.5 секунды по данным.
